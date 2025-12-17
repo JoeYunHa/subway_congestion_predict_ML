@@ -107,6 +107,24 @@ train_df, test_df = train_test_split(
     df_long, test_size=0.2, random_state=42, stratify=df_long["요일구분"]
 )
 
+# target encoding -> 역별 평균 혼잡도 추가
+print("\napplying target encoding (mean congestion by station)")
+
+station_mean_map = train_df.groupby("station_direction_key")["congestion"].mean()
+
+# Train에 매핑
+train_df["station_mean_congestion"] = train_df["station_direction_key"].map(
+    station_mean_map
+)
+
+# Test에 매핑 (Train에 없던 새로운 역이 나오면 전체 평균값으로 대체)
+global_mean = train_df["congestion"].mean()
+test_df["station_mean_congestion"] = (
+    test_df["station_direction_key"].map(station_mean_map).fillna(global_mean)
+)
+
+print("Target encoding added.")
+
 # unseen label 처리
 print("\nencoding categorical features")
 
@@ -132,6 +150,7 @@ for col in categorical_cols:
 
 # train
 feature_cols = [
+    "station_mean_congestion",
     "station_direction_key_encoded",
     "호선_encoded",
     "day_type",
@@ -188,7 +207,9 @@ metadata = {
     "feature_cols": feature_cols,
     "day_mapping": day_mapping,
     "unique_stations": unique_stations,
-    "key_format": "{station_code}_{direction}",  # 중요: Lambda 구현 가이드
+    "key_format": "{station_code}_{direction}",
+    "station_mean_map": station_mean_map.to_dict(),
+    "global_mean": global_mean,
 }
 joblib.dump(metadata, os.path.join(MODEL_DIR, "model_metadata.pkl"))
 
