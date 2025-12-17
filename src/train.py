@@ -56,9 +56,15 @@ print("\nFeature Engineering")
 
 # 시간 파싱
 def parse_time(t_str):
+    t_str = str(t_str).strip()
     try:
-        if ":" in str(t_str):
-            h, m = str(t_str).split(":")
+        # "5시30분" 형태 처리
+        if "시" in t_str and "분" in t_str:
+            h, m = t_str.replace("분", "").split("시")
+            return int(h), int(m)
+        # "05:30" 형태 처리
+        elif ":" in t_str:
+            h, m = t_str.split(":")
             return int(h), int(m)
         return 0, 0
     except:
