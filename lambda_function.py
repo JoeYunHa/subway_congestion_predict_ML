@@ -2,7 +2,7 @@ import json
 import os
 import sys
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import boto3
 import joblib
 import pandas as pd
@@ -200,58 +200,80 @@ def lambda_handler(event, context):
         # 1. 모델 로드
         clf, meta = load_artifacts()
 
-        # 2. 예측 시간 설정 (KST 기준 다음 시간 정각)
-        # Lambda는 기본 UTC이므로 +9시간
-        kst_now = datetime.utcnow() + timedelta(hours=9)
-        target_time = kst_now + timedelta(hours=1)
-        target_time = target_time.replace(minute=0, second=0, microsecond=0)
+        # ---------------------------------------------------------
+        # [Timezone Fix] utcnow() 대체 및 KST 변환 로직
+        # ---------------------------------------------------------
+        # KST 타임존 정의 (UTC+9)
+        KST = timezone(timedelta(hours=9))
 
-        logger.info(f"Predicting for time: {target_time}")
+        # 1) 현재 UTC 시간 (Timezone Aware) 가져오기
+        now_utc = datetime.now(timezone.utc)
 
-        # 3. DB 연결 및 역 정보 조회
+        # 2) KST로 변환
+        now_kst = now_utc.astimezone(KST)
+
+        # 3) DB 저장을 위해 Timezone 정보 제거 (Naive Time으로 변경)
+        # DB 컬럼이 'timestamp without time zone'이므로, '15:00+09:00'을 '15:00'으로 만듦
+        kst_naive = now_kst.replace(tzinfo=None)
+
+        # 예측할 시간 리스트: [현재 시간, 1시간 뒤]
+        # 예: 15시 15분에 실행 -> 15:00(복구용), 16:00(예측용) 두 개 생성
+        target_hours = [0, 1]
+
+        # ---------------------------------------------------------
+
         conn = get_db_connection()
         station_info_map = get_station_info_from_db(conn)
 
-        # 4. 입력 데이터 준비
-        X_pred, meta_df = prepare_features(target_time, station_info_map, meta)
+        total_saved = 0
 
-        if X_pred.empty:
-            return {"statusCode": 200, "body": "No targets to predict."}
+        for h in target_hours:
+            # 시간 계산 (분, 초 0으로 초기화)
+            target_time = kst_naive + timedelta(hours=h)
+            target_time = target_time.replace(minute=0, second=0, microsecond=0)
 
-        # 5. 예측 수행
-        preds = clf.predict(X_pred)
+            logger.info(f"Predicting for time: {target_time}")
 
-        # 6. 결과 저장 (Upsert)
-        # congestion_forecast 테이블 구조: (station_cd, direction, forecast_time, congestion, created_at)
-        # PK는 (station_cd, direction, forecast_time) 복합키 권장
+            # 4. 입력 데이터 준비
+            X_pred, meta_df = prepare_features(target_time, station_info_map, meta)
 
-        data_to_insert = []
-        for (idx, row), pred_val in zip(meta_df.iterrows(), preds):
-            val = round(float(pred_val), 2)
-            val = max(0.0, min(100.0, val))  # 0~100 사이로 클립
+            if X_pred.empty:
+                logger.warning(f"No features available for {target_time}")
+                continue
 
-            # (station_code, direction, time, congestion)
-            data_to_insert.append(
-                (row["station_code"], row["direction"], target_time, val)
-            )
+            # 5. 예측 수행
+            preds = clf.predict(X_pred)
 
-        upsert_sql = """
-            INSERT INTO congestion_forecast 
-            (station_cd, direction, forecast_time, congestion_level, created_at)
-            VALUES (%s, %s, %s, %s, NOW())
-            ON CONFLICT (station_cd, direction, forecast_time) 
-            DO UPDATE SET 
-                congestion_level = EXCLUDED.congestion_level,
-                created_at = NOW();
-        """
+            # 6. 저장 데이터 구성
+            data_to_insert = []
+            for (idx, row), pred_val in zip(meta_df.iterrows(), preds):
+                val = round(float(pred_val), 2)
+                val = max(0.0, min(100.0, val))  # 0~100 클립
 
-        with conn.cursor() as cur:
-            cur.executemany(upsert_sql, data_to_insert)
-        conn.commit()
+                data_to_insert.append(
+                    (row["station_code"], row["direction"], target_time, val)
+                )
 
-        msg = f"Successfully saved {len(data_to_insert)} predictions for {target_time}"
+            # 7. 쿼리 실행 (Upsert)
+            upsert_sql = """
+                INSERT INTO congestion_forecast 
+                (station_cd, direction, forecast_time, congestion_level, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (station_cd, direction, forecast_time) 
+                DO UPDATE SET 
+                    congestion_level = EXCLUDED.congestion_level,
+                    created_at = NOW();
+            """
+
+            with conn.cursor() as cur:
+                cur.executemany(upsert_sql, data_to_insert)
+
+            # [중요] 각 시간대 처리 후 즉시 커밋 (데이터 증발 방지)
+            conn.commit()
+            total_saved += len(data_to_insert)
+
+        msg = f"Successfully saved total {total_saved} predictions (Targets: {target_hours} hours from now)."
         logger.info(msg)
-
         return {"statusCode": 200, "body": json.dumps(msg)}
 
     except Exception as e:
